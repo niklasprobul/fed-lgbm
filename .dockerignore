@@ -1,0 +1,9 @@
+*
+!pyproject.toml
+!src
+!app.yml
+!README.md
+!main.py
+!flnet_app.py
+!test_data
+**/__pycache__

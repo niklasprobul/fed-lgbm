@@ -1,0 +1,162 @@
+info:
+  name: fl-lightgbm
+  slug: fl-lightgbm
+  type: ANALYSIS
+  sourceUrl: https://github.com/niklasprobul/fed-lgbm
+  shortDescription: Federated LightGBM for sites that hold the same features for different rows.
+  longDescription: >-
+    Trains gradient-boosted trees over several sites without pooling rows. Sites share only summed
+    gradient and hessian histograms; the result is an ordinary LightGBM text model that equals LightGBM
+    trained on the pooled rows. Parameters use LightGBM's names and defaults. The number of rounds is
+    computed from them.
+config:
+  hyperparams:
+    # The defaults must equal those in flnet_app.Config: in TEST_MODE the coordinator gets only the defaults.
+    - name: target
+      type: STRING
+      description: Name of the target column in the CSV; every other column is a feature.
+      default: target
+    - name: categorical_columns
+      type: STRING
+      description: Comma-separated names of the categorical columns, coded as non-negative integers.
+      default: ""
+    - name: bounds
+      type: STRING
+      description: >-
+        Optional per-feature bounds as a JSON object, for example {"age": [0, 120], "bmi": [10, 70]},
+        covering every feature; the sites then do not share their minimum and maximum. Empty: share them.
+      default: ""
+    - name: communication_id
+      type: STRING
+      description: Prefix of the per-round communication IDs.
+      default: fl-lightgbm
+    - name: objective
+      type: CATEGORICAL
+      description: regression (L2) or binary (logloss).
+      default: regression
+      options: [regression, binary]
+    - name: num_iterations
+      type: INTEGER
+      description: Number of trees.
+      default: 100
+      minValue: 0
+    - name: num_leaves
+      type: INTEGER
+      description: Maximum number of leaves per tree.
+      default: 31
+      minValue: 2
+      maxValue: 131072
+    - name: learning_rate
+      type: FLOAT
+      description: Shrinkage of each tree's leaf values.
+      default: 0.1
+    - name: max_bin
+      type: INTEGER
+      description: Maximum number of bins per feature.
+      default: 255
+      minValue: 2
+    - name: min_data_in_bin
+      type: INTEGER
+      description: Minimum number of rows in one bin.
+      default: 3
+      minValue: 1
+    - name: min_data_in_leaf
+      type: INTEGER
+      description: Minimum number of rows in one leaf.
+      default: 20
+      minValue: 0
+    - name: min_sum_hessian_in_leaf
+      type: FLOAT
+      description: Minimum sum of hessians in one leaf.
+      default: 0.001
+      minValue: 0
+    - name: lambda_l1
+      type: FLOAT
+      description: L1 regularisation.
+      default: 0.0
+      minValue: 0
+    - name: lambda_l2
+      type: FLOAT
+      description: L2 regularisation.
+      default: 0.0
+      minValue: 0
+    - name: max_delta_step
+      type: FLOAT
+      description: Limit on a leaf's output before shrinkage; 0 means no limit.
+      default: 0.0
+    - name: min_gain_to_split
+      type: FLOAT
+      description: Minimum gain of a split.
+      default: 0.0
+      minValue: 0
+    - name: max_depth
+      type: INTEGER
+      description: Maximum tree depth; -1 means no limit.
+      default: -1
+    - name: use_missing
+      type: BOOLEAN
+      description: Learn a default direction for missing values at every split.
+      default: true
+    - name: zero_as_missing
+      type: BOOLEAN
+      description: Treat zeros as missing values.
+      default: false
+    - name: is_unbalance
+      type: BOOLEAN
+      description: Binary only. Weight the classes by their global frequency.
+      default: false
+    - name: scale_pos_weight
+      type: FLOAT
+      description: Binary only. Weight of the positive class.
+      default: 1.0
+    - name: max_cat_to_onehot
+      type: INTEGER
+      description: Categorical features with at most this many categories are split one category against the rest.
+      default: 4
+      minValue: 1
+    - name: max_cat_threshold
+      type: INTEGER
+      description: Maximum number of categories on one side of a categorical split.
+      default: 32
+      minValue: 1
+    - name: cat_l2
+      type: FLOAT
+      description: L2 regularisation in categorical splits.
+      default: 10.0
+      minValue: 0
+    - name: cat_smooth
+      type: FLOAT
+      description: Smoothing of category statistics in categorical splits.
+      default: 10.0
+      minValue: 0
+    - name: min_data_per_group
+      type: INTEGER
+      description: Minimum number of rows per category group in categorical splits.
+      default: 100
+      minValue: 1
+  input:
+    - name: data
+      type: CSV
+      description: >-
+        The site's rows, with a header row: the target column and the features. For prediction, the model's
+        features; other columns are ignored.
+      required: true
+      hasHeader: true
+  output:
+    - name: model
+      type: TEXT
+      description: The trained model in LightGBM's text format; load it with lightgbm.Booster(model_file=...).
+      mode: TRAINING
+    - name: report
+      type: JSON
+      description: >-
+        Training report: the parameters, the number of sites, rounds used and padding rounds, the training
+        loss after every tree, and the LightGBM parameters for training the central baseline.
+      mode: TRAINING
+    - name: predictions
+      type: CSV
+      description: >-
+        One column, prediction, with one row per row of the input, in the same order: the predicted value for
+        regression, the probability of class 1 for binary.
+      mode: PREDICTION
+      hasHeader: true

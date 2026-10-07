@@ -1,0 +1,40 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "fl-lightgbm"
+version = "0.1.0"
+description = "Federated LightGBM for horizontally partitioned sites"
+requires-python = ">=3.11"
+authors = [{ name = "Niklas Probul" }]
+dependencies = [
+    "numpy>=2,<3",
+    "lightgbm==4.7.0",   # model format, predictor and central baseline; pinned to one release
+]
+
+[dependency-groups]
+dev = [
+    "FL-Net-Python-Tool-API==0.7.12",  # the FL-Net adapter (flnet_app.py); also what the Docker image runs
+    "mypy>=2.4,<3",
+    "pandas>=2,<3",  # the test data (tests/datasets.py) and the adapter; < 3 because the FL-Net SDK requires it
+    "pre-commit>=4,<5",
+    "pytest>=9,<10",
+    "scikit-learn>=1.9,<2",  # the test data (tests/datasets.py)
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/fl_lightgbm"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]  # the FL-Net adapter (flnet_app.py) sits at the repo root, where FL-Net runs it
+markers = ["slow: long runs, left out of the fast suite (run them with `-m slow`, or everything with `-m ''`)"]
+addopts = "-m 'not slow'"
+
+[tool.mypy]
+files = ["src", "flnet_app.py", "main.py"]  # not the tests: they use scikit-learn, which ships without type information
+
+[[tool.mypy.overrides]]
+module = ["pyfedappwrap.*", "pandas"]  # neither ships type information
+ignore_missing_imports = true
