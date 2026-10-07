@@ -8,7 +8,7 @@ It runs as an FL-Net federated tool and as a local simulation.
 
 Each site provides one CSV with a header row. Name the target column in `target`; every other column is a feature. Categorical columns must be coded as non-negative integers and listed in `categorical_columns`. Missing values may be empty cells.
 
-The other hyperparameters are LightGBM's, with LightGBM's names and defaults (`objective` is `regression` or `binary`). LightGBM parameters that would give a different model, such as bagging or `feature_fraction`, are not offered. The number of rounds is computed from the parameters: 2 setup rounds, `num_iterations × (num_leaves − 1)` split rounds, 1 closing round and 1 padding round. FL-Net takes about 1 – 2 s per round, so 100 trees of 31 leaves take roughly 45 – 90 minutes.
+The other hyperparameters are LightGBM's, with LightGBM's names and defaults (`objective` is `regression` or `binary`). LightGBM parameters that would give a different model, such as bagging or `feature_fraction`, are not offered. The number of rounds is computed from the parameters: 3 setup rounds, `num_iterations × (num_leaves − 1)` split rounds, 1 closing round and 1 padding round. FL-Net takes about 1 – 2 s per round, so 100 trees of 31 leaves take roughly 45 – 90 minutes.
 
 `bounds` is optional: a JSON object such as `{"age": [0, 120], "bmi": [10, 70]}` covering every feature. When it is given, the sites do not share their minimum and maximum.
 

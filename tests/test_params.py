@@ -76,7 +76,7 @@ def test_missing_parameters_get_lightgbm_defaults():
     assert (p.lambda_l1, p.lambda_l2, p.max_delta_step, p.min_gain_to_split) == (0.0, 0.0, 0.0, 0.0)
     assert (p.max_cat_to_onehot, p.max_cat_threshold, p.cat_l2, p.cat_smooth, p.min_data_per_group) == (
         4, 32, 10.0, 10.0, 100)
-    assert p.round_budget == 2 + 100 * 30 + 1 + 1  # setup, split, closing and one padding round
+    assert p.round_budget == 3 + 100 * 30 + 1 + 1  # setup, split, closing and one padding round
 
 
 @pytest.mark.parametrize("name, value", [
@@ -111,4 +111,4 @@ def test_max_depth_without_num_leaves_lowers_the_leaf_budget_and_round_budget(pa
     p = Params.from_dict({"num_iterations": 10, **params})
 
     assert p.num_leaves == num_leaves
-    assert p.round_budget == 2 + 10 * (num_leaves - 1) + 1 + 1
+    assert p.round_budget == 3 + 10 * (num_leaves - 1) + 1 + 1

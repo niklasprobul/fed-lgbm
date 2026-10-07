@@ -23,8 +23,8 @@ MISSING_NONE, MISSING_ZERO, MISSING_NAN = "None", "Zero", "NaN"
 # BinMapper::FindBin keeps the bin of 0 as most frequent bin unless another bin holds this share of rows.
 SPARSE_THRESHOLD = 0.7
 
-# Cells of the fine grid per feature (ADR 0004).
-GRID_CELLS = 4096
+# Cells of the grid per feature (ADR 0008).
+GRID_CELLS = 64
 
 
 @dataclass(frozen=True)
@@ -65,55 +65,65 @@ class BinMapper:
             return _value_to_bin(values, self.upper_bounds, self.missing_type)
         return _category_to_bin(values, self.categories)
 
+    def counts(self, values: np.ndarray) -> np.ndarray:
+        """Rows per bin, which the sites count in setup round 3."""
+        return np.bincount(self.value_to_bin(values), minlength=self.num_bins)
+
 
 @dataclass(frozen=True)
 class Grid:
-    """A feature's fine equal-width grid between its global bounds, on which the sites count their rows.
+    """A feature's equal-width grid between its global bounds, on which the sites count their rows in
+    setup round 2 and from which the aggregator interpolates the bin edges.
 
-    The cells have width (hi - lo) / GRID_CELLS (fewer, wider cells for bounds too narrow for that many
-    distinct doubles) and are laid out from 0, so that no cell holds values of both signs. Each cell
-    stands for one distinct value, its centre. The boundary between two neighbouring cells is where
-    GreedyFindBin puts a bin bound between their values, so every bound it chooses either is a cell
-    boundary or lies in a run of empty cells, and the rows per agreed bin are sums of cells.
-    Zeros (|x| <= kZeroThreshold, as LightGBM samples them) and NaN are not in the grid.
+    Cell k holds the values in (bounds[k], bounds[k + 1]], the first cell also `lo` itself. The cells have
+    width (hi - lo) / GRID_CELLS (fewer, wider cells for bounds too narrow for that many distinct doubles)
+    and are laid out from 0, so that no cell holds values of both signs; the outermost cells end at the
+    bounds. Zeros (|x| <= kZeroThreshold, as LightGBM samples them) and NaN are not in the grid.
     """
 
-    values: np.ndarray  # one per cell, ascending
+    bounds: np.ndarray  # ascending: lo, the boundaries between cells, hi; empty without cells
     lo: float  # the global bounds, NaN if no site has a value
     hi: float
 
+    @property
+    def num_cells(self) -> int:
+        return max(len(self.bounds) - 1, 0)
+
     def counts(self, x: np.ndarray) -> np.ndarray:
-        """Rows per cell. A value beyond the outermost cell of its sign counts in that cell."""
+        """Rows per cell."""
         x = x[np.abs(x) > ZERO_THRESHOLD]  # also drops NaN
-        boundaries = _midpoint_bound(self.values[:-1], self.values[1:])
-        return np.bincount(np.searchsorted(boundaries, x, side="left"), minlength=len(self.values))
+        return np.bincount(np.searchsorted(self.bounds[1:-1], x, side="left"), minlength=self.num_cells)
 
 
 def grid(lo: float, hi: float) -> Grid:
-    """The grid between a feature's global bounds; a single cell if they are equal, none if they are NaN.
+    """The grid between a feature's global bounds; a single cell if they are equal, none if they are NaN or 0.
 
-    Bounds so narrow, and so far from 0, that the cells' values would not be distinct doubles get fewer
-    cells: the cell count is halved until the bound GreedyFindBin puts between neighbouring cells lies
-    below the upper one's value, which also puts them more than one ulp apart, so FindBin would not merge
-    them. Bounds too close for even two such cells get a single cell.
+    Bounds so narrow, and so far from 0, that the boundaries between cells would not be distinct doubles
+    get fewer cells: the cell count is halved until they are.
     """
     num_cells = GRID_CELLS
     while lo < hi and num_cells >= 1:
-        width = (hi - lo) / num_cells
+        # (hi - lo) / num_cells, without overflowing for bounds near the largest doubles; num_cells is a power of 2
+        width = hi / num_cells - lo / num_cells
         if width > 0:  # a subnormal range divided into many cells underflows to 0
-            cells = np.arange(np.floor(lo / width), np.ceil(hi / width))  # cell k holds (k * width, (k + 1) * width]
-            values = (cells + 0.5) * width
-            if np.all(_midpoint_bound(values[:-1], values[1:]) < values[1:]):
-                return Grid(values, lo, hi)
+            inner = np.arange(np.floor(lo / width) + 1, np.ceil(hi / width)) * width  # cell k ends at (k + 1) * width
+            bounds = np.concatenate([[lo], inner[(lo < inner) & (inner < hi)], [hi]])
+            if np.all(np.diff(bounds) > 0):
+                return Grid(bounds, lo, hi)
         num_cells //= 2
-    return Grid(np.array([lo]) if abs(lo) > ZERO_THRESHOLD else np.empty(0), lo, hi)
+    return Grid(np.array([lo, hi]) if lo < hi or abs(lo) > ZERO_THRESHOLD else np.empty(0), lo, hi)
 
 
 def agree_bin_mapper(grid: Grid, cell_counts: np.ndarray, na_count: int, num_data: int, params: Params) -> BinMapper:
-    """Setup round 2: BinMapper::FindBin on the merged grid, with the cells as distinct values.
+    """Setup round 2: equal-count bin edges interpolated from the merged grid, with the values taken as
+    spread evenly within each cell.
 
-    `cell_counts` and `na_count` are summed over the sites, `num_data` is the global row count; the
-    rows in neither are zeros. Without `use_missing`, and with `zero_as_missing`, NaN is read as zero.
+    LightGBM, given these edges as forced bins (FindBinWithPredefinedBin), keeps them as they are: zero
+    has a bin of its own, there are at most `max_bin` bins (one of them for NaN), and the nonzero rows get
+    at most one bin per `min_data_in_bin` rows, one more where 0 splits one. `cell_counts` and `na_count`
+    are summed over the sites, `num_data` is the global row count; the rows in neither are zeros. Without
+    `use_missing`, and with `zero_as_missing`, NaN is read as zero. The most frequent bin is the bin of 0
+    until setup round 3 has counted the rows per bin (`with_most_freq_bin`).
     """
     if not params.use_missing:
         missing_type = MISSING_NONE
@@ -121,43 +131,48 @@ def agree_bin_mapper(grid: Grid, cell_counts: np.ndarray, na_count: int, num_dat
         missing_type = MISSING_ZERO
     else:
         missing_type = MISSING_NAN if na_count > 0 else MISSING_NONE
+    max_bin = params.max_bin - 1 if missing_type == MISSING_NAN else params.max_bin
+    num_negative = int(cell_counts[grid.bounds[1:] <= 0.0].sum())
+    num_nonzero = int(cell_counts.sum())
+    zero_bounds = _zero_bounds(num_negative > 0, num_nonzero > num_negative, max_bin)
+    num_edges = min(max_bin - len(zero_bounds), num_nonzero // params.min_data_in_bin) - 1
+    edges = np.unique(np.concatenate([_equal_count_edges(grid, cell_counts, num_edges), zero_bounds]))
+
+    bounds = np.append(edges, np.inf)
+    if missing_type == MISSING_NAN:
+        bounds = np.append(bounds, np.nan)
+    elif missing_type == MISSING_ZERO and len(bounds) == 2:
+        missing_type = MISSING_NONE
     na_cnt = na_count if missing_type == MISSING_NAN else 0
-    non_empty = cell_counts > 0
-    values, counts = grid.values[non_empty].tolist(), cell_counts[non_empty].tolist()
-    zero_cnt = num_data - sum(counts) - na_cnt
-
-    # Distinct values with zero put in between the signs: FindBin adds it when there are zeros, when
-    # there are no other values, and between negative and positive values even without zeros. The
-    # cells' values do not merge as close doubles do in FindBin, because `grid` keeps them more than one
-    # ulp apart.
-    num_negative = sum(v < 0.0 for v in values)
-    with_zero = zero_cnt > 0 or not values or 0 < num_negative < len(values)
-    zero = ([0.0], [zero_cnt]) if with_zero else ([], [])
-    distinct = values[:num_negative] + zero[0] + values[num_negative:]
-    distinct_counts = counts[:num_negative] + zero[1] + counts[num_negative:]
-
-    if missing_type == MISSING_NAN:
-        bounds = _find_bin_with_zero_as_one_bin(distinct, distinct_counts, params.max_bin - 1, num_data - na_cnt,
-                                                params.min_data_in_bin) + [np.nan]
-    else:
-        bounds = _find_bin_with_zero_as_one_bin(distinct, distinct_counts, params.max_bin, num_data,
-                                                params.min_data_in_bin)
-        if missing_type == MISSING_ZERO and len(bounds) == 2:
-            missing_type = MISSING_NONE
-
-    cnt_in_bin = np.zeros(len(bounds), dtype=np.int64)
-    i_bin = 0
-    for v, c in zip(distinct, distinct_counts):
-        while v > bounds[i_bin] and i_bin < len(bounds) - 1:
-            i_bin += 1
-        cnt_in_bin[i_bin] += c
-    if missing_type == MISSING_NAN:
-        cnt_in_bin[-1] = na_cnt
-
-    edges = np.array(bounds)
+    # FindBin puts a 0 among the distinct values when there are zeros, when there are no other values, and
+    # between negative and positive values even without zeros.
+    with_zero = num_data - num_nonzero - na_cnt > 0 or num_nonzero == 0 or 0 < num_negative < num_nonzero
     min_val, max_val = _value_range(grid.lo, grid.hi, with_zero)
-    return BinMapper(edges, missing_type, _most_freq_bin(cnt_in_bin, default_bin(edges, missing_type), num_data),
-                     min_val=min_val, max_val=max_val)
+    return BinMapper(bounds, missing_type, default_bin(bounds, missing_type), min_val=min_val, max_val=max_val)
+
+
+def _zero_bounds(negative: bool, positive: bool, max_bin: int) -> list[float]:
+    """The bounds FindBinWithPredefinedBin puts around zero before any forced bound, where there are
+    negative or positive values: both with at least 3 bins, with 2 only the one below 0 if there are
+    negative values. Without nonzero values there are none, and LightGBM, given no forced bound, finds none."""
+    if not (negative or positive) or max_bin < 2:
+        return []
+    if max_bin == 2:
+        return [-ZERO_THRESHOLD if negative else ZERO_THRESHOLD]
+    return [-ZERO_THRESHOLD] * negative + [ZERO_THRESHOLD] * positive
+
+
+def _equal_count_edges(grid: Grid, cell_counts: np.ndarray, num_edges: int) -> np.ndarray:
+    """`num_edges` edges that split the grid's rows into bins of equal count, with the values taken as spread
+    evenly within each cell. Edges within kZeroThreshold of 0 are left out: zero has a bin of its own."""
+    if num_edges < 1:
+        return np.empty(0)
+    cum = np.concatenate([[0], np.cumsum(cell_counts)])
+    targets = np.arange(1, num_edges + 1) * cum[-1] / (num_edges + 1)
+    cell = np.searchsorted(cum, targets, side="left") - 1  # the cell each target lies in, which is not empty
+    inside = (targets - cum[cell]) / (cum[cell + 1] - cum[cell])
+    edges = grid.bounds[cell] + inside * (grid.bounds[cell + 1] - grid.bounds[cell])
+    return edges[np.abs(edges) > ZERO_THRESHOLD]
 
 
 def _value_range(lo: float, hi: float, with_zero: bool) -> tuple[float, float]:
@@ -165,6 +180,11 @@ def _value_range(lo: float, hi: float, with_zero: bool) -> tuple[float, float]:
     0, as LightGBM samples it, and the 0 it puts among the distinct values widens the range."""
     lo, hi = (0.0 if abs(b) <= ZERO_THRESHOLD else float(b) for b in (lo, hi))  # NaN stays NaN
     return (float(np.fmin(lo, 0.0)), float(np.fmax(hi, 0.0))) if with_zero else (lo, hi)
+
+
+def with_most_freq_bin(mapper: BinMapper, cnt_in_bin: np.ndarray, num_data: int) -> BinMapper:
+    """Setup round 3: the feature's most frequent bin from its rows per agreed bin, summed over the sites."""
+    return replace(mapper, most_freq_bin=_most_freq_bin(cnt_in_bin, mapper.default_bin, num_data))
 
 
 def _most_freq_bin(cnt_in_bin: np.ndarray, zero_bin: int, num_data: int) -> int:
@@ -226,108 +246,8 @@ def agree_categorical_bin_mapper(categories: Categories, counts: np.ndarray, na_
     # MissingType::None marks a feature whose bins hold every category and no NaN.
     missing_type = MISSING_NONE if len(kept) == len(categories.values) and na_count == 0 else MISSING_NAN
     cnt_in_bin[0] = num_data - used_cnt
-    mapper = BinMapper(np.empty(0), missing_type, 0, np.array(kept, dtype=np.int64))
-    return replace(mapper, most_freq_bin=_most_freq_bin(np.array(cnt_in_bin), mapper.default_bin, num_data))
-
-
-def _find_bin_with_zero_as_one_bin(distinct: list[float], counts: list[int], max_bin: int, total_cnt: int,
-                                   min_data_in_bin: int) -> list[float]:
-    """FindBinWithZeroAsOneBin: negative values, zero and positive values get bins of their own."""
-    left_cnt_data = sum(c for v, c in zip(distinct, counts) if v <= -ZERO_THRESHOLD)
-    right_cnt_data = sum(c for v, c in zip(distinct, counts) if v > ZERO_THRESHOLD)
-    cnt_zero = sum(counts) - left_cnt_data - right_cnt_data
-    left_cnt = next((i for i, v in enumerate(distinct) if v > -ZERO_THRESHOLD), len(distinct))
-
-    bounds: list[float] = []
-    if left_cnt > 0 and max_bin > 1:
-        left_max_bin = max(1, int(left_cnt_data / (total_cnt - cnt_zero) * (max_bin - 1)))
-        bounds = _greedy_find_bin(distinct[:left_cnt], counts[:left_cnt], left_max_bin, left_cnt_data, min_data_in_bin)
-        if bounds:
-            bounds[-1] = -ZERO_THRESHOLD
-
-    right_start = next((i for i in range(left_cnt, len(distinct)) if distinct[i] > ZERO_THRESHOLD), -1)
-    right_max_bin = max_bin - 1 - len(bounds)
-    if right_start >= 0 and right_max_bin > 0:
-        right = _greedy_find_bin(distinct[right_start:], counts[right_start:], right_max_bin, right_cnt_data,
-                                 min_data_in_bin)
-        return bounds + [ZERO_THRESHOLD] + right
-    return bounds + [np.inf]
-
-
-def _greedy_find_bin(distinct: list[float], counts: list[int], max_bin: int, total_cnt: int,
-                     min_data_in_bin: int) -> list[float]:
-    """GreedyFindBin: bin upper bounds over sorted distinct values, the last one +inf."""
-    bounds: list[float] = []
-    n = len(distinct)
-    if n <= max_bin:
-        cur_cnt_inbin = 0
-        for i in range(n - 1):
-            cur_cnt_inbin += counts[i]
-            if cur_cnt_inbin >= min_data_in_bin:
-                val = float(_midpoint_bound(distinct[i], distinct[i + 1]))
-                if not bounds or not _check_double_equal_ordered(bounds[-1], val):
-                    bounds.append(val)
-                    cur_cnt_inbin = 0
-        return bounds + [np.inf]
-
-    if min_data_in_bin > 0:
-        max_bin = max(min(max_bin, total_cnt // min_data_in_bin), 1)
-    mean_bin_size = total_cnt / max_bin
-    rest_bin_cnt, rest_sample_cnt = max_bin, total_cnt
-    is_big = [c >= mean_bin_size for c in counts]
-    for c, big in zip(counts, is_big):
-        if big:
-            rest_bin_cnt -= 1
-            rest_sample_cnt -= c
-    mean_bin_size = _divide(rest_sample_cnt, rest_bin_cnt)
-    upper_bounds, lower_bounds = [np.inf] * max_bin, [np.inf] * max_bin
-
-    bin_cnt = 0
-    lower_bounds[0] = distinct[0]
-    cur_cnt_inbin = 0
-    for i in range(n - 1):
-        if not is_big[i]:
-            rest_sample_cnt -= counts[i]
-        cur_cnt_inbin += counts[i]
-        if is_big[i] or cur_cnt_inbin >= mean_bin_size or (
-                is_big[i + 1] and cur_cnt_inbin >= _cpp_max(1.0, mean_bin_size * 0.5)):
-            upper_bounds[bin_cnt] = distinct[i]
-            bin_cnt += 1
-            lower_bounds[bin_cnt] = distinct[i + 1]
-            if bin_cnt >= max_bin - 1:
-                break
-            cur_cnt_inbin = 0
-            if not is_big[i]:
-                rest_bin_cnt -= 1
-                mean_bin_size = _divide(rest_sample_cnt, rest_bin_cnt)
-    bin_cnt += 1
-
-    for i in range(bin_cnt - 1):
-        val = float(_midpoint_bound(upper_bounds[i], lower_bounds[i + 1]))
-        if not bounds or not _check_double_equal_ordered(bounds[-1], val):
-            bounds.append(val)
-    return bounds + [np.inf]
-
-
-def _midpoint_bound(a, b):
-    """The bin bound GreedyFindBin puts between neighbouring distinct values: just above their midpoint."""
-    return np.nextafter((a + b) / 2.0, np.inf)
-
-
-def _check_double_equal_ordered(a: float, b: float) -> bool:
-    """Common::CheckDoubleEqualOrdered: b, known to be >= a, is at most one ulp above it."""
-    return b <= np.nextafter(a, np.inf)
-
-
-def _divide(a: int, b: int) -> float:
-    """C++ double division, which gives inf or NaN rather than raising when b is 0."""
-    with np.errstate(divide="ignore", invalid="ignore"):
-        return float(np.float64(a) / b)
-
-
-def _cpp_max(a: float, b: float) -> float:
-    """std::max, which returns `a` when either is NaN."""
-    return b if a < b else a
+    return with_most_freq_bin(BinMapper(np.empty(0), missing_type, 0, np.array(kept, dtype=np.int64)),
+                              np.array(cnt_in_bin), num_data)
 
 
 def default_bin(edges: np.ndarray, missing_type: str) -> int:

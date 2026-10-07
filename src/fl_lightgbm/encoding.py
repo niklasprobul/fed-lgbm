@@ -1,4 +1,4 @@
-"""Payload encodings: how a site writes its grid counts, histograms and other sums for the aggregator
+"""Payload encodings: how a site writes its row counts, histograms and other sums for the aggregator
 (ADR 0003, 0006).
 
 Both ends hold the same encoding; the site encodes, the aggregator decodes and sums. Every encoding
@@ -6,8 +6,8 @@ must give the same sums wherever the aggregator reads them.
 
 - `SPARSE`, the plaintext default: each feature's most frequent bin is skipped (the aggregator rebuilds
   it from the leaf totals, as LightGBM's FixHistogram does), only non-empty bins and grid cells are
-  listed, and the numbers travel as base64 little-endian binary. Grid counts have no most frequent bin
-  to skip: zeros are not in the grid, the aggregator derives their count.
+  listed, and the numbers travel as base64 little-endian binary. The row counts of the setup rounds skip
+  no bin: the most frequent bins are fixed only from the counts of setup round 3.
 - `DENSE`: every bin and cell as a JSON list of float64 or int values; the plaintext reference.
 - `FixedPoint(exponent)`, for secure aggregation (FL-Net SMPC, not switched on in v1): every bin and
   cell, in the same layout from every site, as one flat list of integers, because SMPC sums numbers
@@ -29,10 +29,10 @@ Encoded = dict | list  # JSON-ready
 
 class Encoding(Protocol):
     def encode_counts(self, counts: np.ndarray) -> Encoded:
-        """A site's rows per grid cell, all features in one flat array."""
+        """A site's rows per grid cell, category or agreed bin, all features in one flat array."""
 
     def decode_counts(self, encoded: Encoded, size: int) -> np.ndarray:
-        """The `size` grid counts; a cell that was not sent is 0."""
+        """The `size` counts; a cell or bin that was not sent is 0."""
 
     def encode_histogram(self, hist: Histogram, most_freq_bins: np.ndarray) -> Encoded:
         """A site's histogram of one leaf; `most_freq_bins` are the flat indices of the bins the aggregator

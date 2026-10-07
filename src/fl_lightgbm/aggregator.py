@@ -10,7 +10,8 @@ from dataclasses import asdict
 
 import numpy as np
 
-from fl_lightgbm.binning import BinMapper, Categories, agree_bin_mapper, agree_categorical_bin_mapper, grid
+from fl_lightgbm.binning import (BinMapper, Categories, Grid, agree_bin_mapper, agree_categorical_bin_mapper, grid,
+                                 with_most_freq_bin)
 from fl_lightgbm.encoding import SPARSE, Encoding
 from fl_lightgbm.grower import TreeGrower
 from fl_lightgbm.histogram import Histogram, feature_offsets
@@ -59,13 +60,17 @@ class Aggregator:
             return self._setup(payloads)
         if self._round == 2:
             self._agree_bin_edges(payloads)
-            self._grower = TreeGrower(self.bin_mappers, self.params) if self.params.num_iterations else None
             return {
                 "bin_upper_bounds": [m.upper_bounds.tolist() for m in self.bin_mappers],
                 "missing_types": [m.missing_type for m in self.bin_mappers],
-                "most_freq_bins": [m.most_freq_bin for m in self.bin_mappers],  # the bins sites may leave out
                 "bin_categories": [m.categories.tolist() if m.categories is not None else None
                                    for m in self.bin_mappers],
+            }
+        if self._round == 3:
+            self._agree_most_freq_bins(payloads)
+            self._grower = TreeGrower(self.bin_mappers, self.params) if self.params.num_iterations else None
+            return {
+                "most_freq_bins": [m.most_freq_bin for m in self.bin_mappers],  # the bins sites may leave out
                 **self._split_reply([], None),
             }
         self._take_tree_totals(payloads)
@@ -108,8 +113,10 @@ class Aggregator:
         return reply
 
     def _agree_bin_edges(self, payloads: list[dict]) -> None:
-        """Merge the sites' grid, category and missing-value counts and fix the agreed bin edges."""
-        offsets = feature_offsets(np.array([len(g.values) for g in self.grids]))
+        """Merge the sites' grid, category and missing-value counts and fix the agreed bin edges; a numerical
+        feature's most frequent bin follows in setup round 3."""
+        offsets = feature_offsets(np.array([g.num_cells if isinstance(g, Grid) else len(g.values)
+                                            for g in self.grids]))
         counts = np.sum([self.encoding.decode_counts(p["grid_counts"], offsets[-1]) for p in payloads], axis=0)
         na_counts = np.sum([p["na_counts"] for p in payloads], axis=0)
         self.bin_mappers: list[BinMapper] = []
@@ -119,6 +126,15 @@ class Aggregator:
                 self.bin_mappers.append(agree_categorical_bin_mapper(g, cells, na_count, self.num_data, self.params))
             else:
                 self.bin_mappers.append(agree_bin_mapper(g, cells, na_count, self.num_data, self.params))
+
+    def _agree_most_freq_bins(self, payloads: list[dict]) -> None:
+        """Fix each numerical feature's most frequent bin from the sites' rows per agreed bin."""
+        numerical = [f for f, m in enumerate(self.bin_mappers) if not m.is_categorical]
+        offsets = feature_offsets(np.array([self.bin_mappers[f].num_bins for f in numerical], dtype=np.int64))
+        counts = np.sum([self.encoding.decode_counts(p["bin_counts"], offsets[-1]) for p in payloads], axis=0)
+        for i, f in enumerate(numerical):
+            self.bin_mappers[f] = with_most_freq_bin(self.bin_mappers[f], counts[offsets[i]:offsets[i + 1]],
+                                                     self.num_data)
 
     def _take_tree_totals(self, payloads: list[dict]) -> None:
         """Put the true row counts into the tree finished last round, and record the training loss after it.

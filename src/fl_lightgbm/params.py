@@ -90,6 +90,6 @@ class Params:
 
     @property
     def round_budget(self) -> int:
-        """Two setup rounds, one split round per possible split, the closing round and one padding round,
-        so that the reply that delivers the model is never the last one (ADR 0005)."""
-        return 2 + self.num_iterations * (self.num_leaves - 1) + 1 + 1
+        """Three setup rounds, one split round per possible split, the closing round and one padding round,
+        so that the reply that delivers the model is never the last one (ADR 0005, 0008)."""
+        return 3 + self.num_iterations * (self.num_leaves - 1) + 1 + 1

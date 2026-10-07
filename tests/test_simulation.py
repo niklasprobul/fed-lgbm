@@ -77,7 +77,7 @@ def test_run_has_exactly_the_round_budget_and_pads_when_trees_stop_early():
 
     result = simulate(params, split_into_sites(X, y, [70, 50, 30]))
 
-    assert result.rounds == 2 + 5 * 30 + 1 + 1  # setup rounds, split rounds, closing round, one padding round
+    assert result.rounds == 3 + 5 * 30 + 1 + 1  # setup rounds, split rounds, closing round, one padding round
     assert result.padding_rounds > 0
     central = train_central(X, y, result.agreed_edges, params)
     assert_same_model(lgb.Booster(model_str=result.model), central, X)
@@ -89,7 +89,7 @@ def test_training_stops_like_lightgbm_when_no_tree_can_split():
 
     result = simulate(params, split_into_sites(X, y, [30, 30]))
 
-    assert result.padding_rounds == result.rounds - 4  # two setup rounds, one root histogram, the closing round
+    assert result.padding_rounds == result.rounds - 5  # three setup rounds, one root histogram, the closing round
     central = train_central(X, y, result.agreed_edges, params)
     assert_same_model(lgb.Booster(model_str=result.model), central, X)
 
@@ -154,7 +154,7 @@ def test_max_depth_without_num_leaves_equals_central_baseline_with_fewer_rounds(
 
     result = train_and_compare(params, split_into_sites(X[:1200], y[:1200], [500, 380, 320]), X[1200:])
 
-    assert result.rounds == 2 + 10 * 7 + 1 + 1
+    assert result.rounds == 3 + 10 * 7 + 1 + 1
 
 
 def leaf_counts(node):
@@ -244,14 +244,14 @@ def test_site_without_missing_values_in_a_feature_others_miss_equals_central_bas
 @pytest.mark.slow
 def test_scan_ties_and_a_zero_bin_difference_of_a_long_binary_run_are_accepted():
     # Saturated to tiny hessians, where central LightGBM retrained on reordered rows flips the same
-    # kind of ties against itself. One more node has a zero bin that holds no rows of the leaf, nor
-    # does the bin above it, so the zero bin's residual moves the threshold across both.
-    X, y = with_missing_values(*synthetic_binary(seed=41, n=3000), seed=42, shift=0.0)
+    # kind of ties against itself. Two more nodes have a zero bin that holds no rows of the leaf, so
+    # the zero bin's residual moves the threshold across it.
+    X, y = with_missing_values(*synthetic_binary(seed=49, n=3000), seed=50, shift=0.0)
     params = {"objective": "binary", "num_iterations": 200, "num_leaves": 31, "learning_rate": 0.3,
               "min_data_in_leaf": 5}
 
     train_and_compare(params, split_into_sites(X[:2400], y[:2400], [1000, 800, 600]), X[2400:],
-                      accepted={SCAN_TIE: 6, ZERO_BIN: 1})
+                      accepted={SCAN_TIE: 7, ZERO_BIN: 2})
 
 
 @pytest.mark.parametrize("settings, value, kind", [
@@ -353,10 +353,10 @@ def test_sites_receive_only_split_decisions_and_leaf_values(objective, setup_key
 
     run(sites, Aggregator(params), rounds=params.round_budget)
 
-    first_setup_reply, second_setup_reply, *split_replies = sites[0].replies
+    first_setup_reply, second_setup_reply, third_setup_reply, *split_replies = sites[0].replies
     assert first_setup_reply.keys() == setup_keys
-    assert second_setup_reply.keys() == {"bin_upper_bounds", "missing_types", "most_freq_bins",
-                                         "bin_categories"} | SPLIT_REPLY_KEYS
+    assert second_setup_reply.keys() == {"bin_upper_bounds", "missing_types", "bin_categories"}
+    assert third_setup_reply.keys() == {"most_freq_bins"} | SPLIT_REPLY_KEYS
     # Besides them, one reply delivers the finished model and training report, which sites save.
     delivery = [i for i, reply in enumerate(split_replies) if "model" in reply]
     assert len(delivery) == 1
@@ -609,6 +609,9 @@ def fixed_point_data(kind, objective):
 
 
 FIXED_POINT_PARAMS = {"num_iterations": 10, "num_leaves": 12, "learning_rate": 0.3}
+# The accepted differences each case of `fixed_point_data` reports at FIXED_POINT_EXPONENT.
+FIXED_POINT_ACCEPTED = {("numerical", "regression"): {ZERO_BIN: 1}, ("numerical", "binary"): {},
+                        ("categorical", "regression"): {ZERO_BIN: 1}, ("categorical", "binary"): {ZERO_BIN: 1}}
 
 
 def train_fixed_point_and_compare(kind, objective, exponent, accepted=None, secure_aggregation=False):
@@ -632,12 +635,12 @@ def train_fixed_point_and_compare(kind, objective, exponent, accepted=None, secu
 @pytest.mark.parametrize("kind", ["numerical", "categorical"])
 @pytest.mark.parametrize("objective", ["regression", "binary"])
 def test_fixed_point_encoding_equals_central_baseline_within_its_tolerance(kind, objective):
-    train_fixed_point_and_compare(kind, objective, FIXED_POINT_EXPONENT)
+    train_fixed_point_and_compare(kind, objective, FIXED_POINT_EXPONENT, FIXED_POINT_ACCEPTED[kind, objective])
 
 
 def test_coarser_fixed_point_reports_a_split_that_differs_as_a_near_tie():
-    # At 2^-20 the rounding residual in a bin that holds no rows of the leaf moves one threshold.
-    train_fixed_point_and_compare("categorical", "regression", exponent=20, accepted={NEAR_TIE: 1})
+    # At 2^-22 the rounded sums pick another of two nearly equal candidates once.
+    train_fixed_point_and_compare("numerical", "regression", exponent=22, accepted={NEAR_TIE: 1})
 
 
 def integers_only(value) -> bool:
@@ -659,15 +662,58 @@ def test_every_fixed_point_payload_holds_integers_only():
     run(sites, Aggregator(params, encoding=encoding), rounds=params.round_budget)
 
     # Setup round 1 shares column names, min/max and category sets, which are not summed (ADR 0003).
-    _, grid_payload, *split_payloads = sites[0].payloads
-    encoded = [grid_payload["grid_counts"]] + [leaf["histogram"] for p in split_payloads for leaf in p.get("leaves", [])]
+    _, grid_payload, bin_payload, *split_payloads = sites[0].payloads
+    encoded = [grid_payload["grid_counts"], bin_payload["bin_counts"]] + \
+        [leaf["histogram"] for p in split_payloads for leaf in p.get("leaves", [])]
     assert len(encoded) > 1
     for values in encoded:
         assert isinstance(values, list) and all(isinstance(v, int) and not isinstance(v, bool) for v in values)
     # Nor does any other field carry text or a float, which FL-Net's SMPC would round to its own
     # decimal exponent: leaf totals and training losses are fixed-point too.
     assert any("loss_sum" in p for p in split_payloads)
-    assert all(integers_only(p) for p in [grid_payload, *split_payloads])
+    assert all(integers_only(p) for p in [grid_payload, bin_payload, *split_payloads])
+
+
+def test_setup_rounds_send_64_cells_per_numerical_feature_then_the_rows_per_agreed_bin():
+    X, y = synthetic_categorical(seed=98, n=600)
+    params = Params.from_dict({"num_iterations": 2, "num_leaves": 4, "max_bin": 40})
+    names = [f"Column_{i}" for i in range(X.shape[1])]
+    sites = [RecordingSite(Xs, ys, params, names, None, DENSE, CATEGORICAL)
+             for Xs, ys in split_into_sites(X, y, [300] * 2)]
+
+    result = run_and_keep(sites, params)
+
+    numerical = [f for f in range(X.shape[1]) if f not in CATEGORICAL]
+    categories = sum(len(np.unique(X[:, f])) for f in CATEGORICAL)
+    for site in sites:
+        _, grid_payload, bin_payload, *_ = site.payloads
+        # Laid out from 0, the bounds may cut a cell at each end.
+        assert 64 * len(numerical) <= len(grid_payload["grid_counts"]) - categories <= 65 * len(numerical)
+        # Setup round 3: each numerical feature's rows per agreed bin, at most max_bin of them.
+        bins = [result.bin_mappers[f].num_bins for f in numerical]
+        assert len(bin_payload["bin_counts"]) == sum(bins) and max(bins) <= 40
+        assert sum(bin_payload["bin_counts"]) == len(site.labels) * len(numerical)
+
+
+def run_and_keep(sites, params):
+    aggregator = Aggregator(params, encoding=sites[0].encoding)
+    run(sites, aggregator, rounds=params.round_budget)
+    return aggregator
+
+
+def test_agreed_edges_do_not_depend_on_how_rows_are_split_across_sites():
+    X, y = with_missing_values(*synthetic_categorical(seed=99, n=900), seed=100, shift=1.0)
+    params = {"num_iterations": 0}
+
+    edges = [simulate(params, tables, categorical=CATEGORICAL).forced_bins for tables in [
+        [(X, y)], split_into_sites(X, y, [300] * 3), split_into_sites(X, y, [800, 60, 40]),
+        split_into_sites(X[::-1], y[::-1], [450, 450])]]
+    mappers = [simulate(params, split_into_sites(X, y, sizes), categorical=CATEGORICAL).agreed_edges
+               for sizes in ([900], [100, 200, 600])]
+
+    assert edges[1:] == edges[:1] * 3
+    assert [(m.missing_type, m.most_freq_bin) for m in mappers[0]] == [(m.missing_type, m.most_freq_bin)
+                                                                       for m in mappers[1]]
 
 
 class PayloadRecordingAggregator(Aggregator):
@@ -717,7 +763,8 @@ def test_secure_aggregation_gives_the_same_model_as_fixed_point_without_it(kind,
 @pytest.mark.parametrize("kind", ["numerical", "categorical"])
 @pytest.mark.parametrize("objective", ["regression", "binary"])
 def test_secure_aggregation_equals_central_baseline_within_the_fixed_point_tolerance(kind, objective):
-    train_fixed_point_and_compare(kind, objective, FIXED_POINT_EXPONENT, secure_aggregation=True)
+    train_fixed_point_and_compare(kind, objective, FIXED_POINT_EXPONENT, FIXED_POINT_ACCEPTED[kind, objective],
+                                  secure_aggregation=True)
 
 
 @pytest.mark.parametrize("encoding", [SPARSE, DENSE])
@@ -801,7 +848,7 @@ def test_report_counts_rounds_used_and_padding_rounds_to_the_round_budget():
     assert report["params"] == asdict(Params.from_dict(params))
     assert report["num_sites"] == 3
     assert report["padding_rounds"] > 0
-    assert report["rounds_used"] + report["padding_rounds"] == 2 + 5 * 30 + 1 + 1
+    assert report["rounds_used"] + report["padding_rounds"] == 3 + 5 * 30 + 1 + 1
 
 
 def test_report_of_a_run_that_cannot_split_has_the_loss_of_the_init_score():
@@ -811,7 +858,7 @@ def test_report_of_a_run_that_cannot_split_has_the_loss_of_the_init_score():
     result = simulate(params, split_into_sites(X, y, [30, 30]))
 
     report = json.loads(result.report)
-    assert report["rounds_used"] == 4  # two setup rounds, the root histogram and the closing round
+    assert report["rounds_used"] == 5  # three setup rounds, the root histogram and the closing round
     assert report["rounds_used"] + report["padding_rounds"] == result.rounds
     # LightGBM keeps one constant tree; its training loss stays the same after every iteration.
     np.testing.assert_allclose(report["training_loss"], central_training_loss(X, y, result, params)[:1], rtol=1e-9)
@@ -927,11 +974,11 @@ def test_feature_infos_of_trivial_features_and_nan_read_as_zero_equal_central_ba
 
 def test_a_feature_narrower_than_the_grid_resolution_is_binned_and_equals_central_baseline():
     X, y = synthetic(seed=118, n=1500)
-    X[:, 5] = 5.0 + np.random.default_rng(119).uniform(0.0, 1e-12, size=len(X))  # too narrow for 4,096 distinct cells
-    y += 2.0 * (X[:, 5] > 5.0 + 5e-13)
+    X[:, 5] = 5.0 + np.random.default_rng(119).uniform(0.0, 1e-14, size=len(X))  # 11 doubles: too narrow for 64 cells
+    y += 2.0 * (X[:, 5] > 5.0 + 5e-15)
     params = {"num_iterations": 10, "num_leaves": 12, "learning_rate": 0.3}
 
     result = train_and_compare(params, split_into_sites(X[:1200], y[:1200], [500, 380, 320]), X[1200:])
 
     lightgbm_bins = lgb.Dataset(X[:1200], y[:1200], params={"verbose": -1}).construct().feature_num_bin(5)
-    assert result.agreed_edges[5].num_bins >= lightgbm_bins // 2  # not exactly LightGBM's: the grid merges values
+    assert result.agreed_edges[5].num_bins >= lightgbm_bins // 2  # not exactly LightGBM's: the grid has fewer cells

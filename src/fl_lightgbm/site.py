@@ -3,10 +3,11 @@
 The first round is setup round 1 (schema, min/max unless bounds are configured, category sets, row count,
 Σlabel). The second is setup round 2: the site counts its rows on each feature's grid between the global
 bounds, or per category of the merged category sets, and its missing values, from which the aggregator
-agrees the bin edges. Every later round is a split round, the closing round or a padding round; the first
-of them bins the data with the agreed bin edges. The round after a tree is complete carries that tree's
-per-leaf row counts and the site's training loss after it. The reply that ends training delivers the
-finished model and the training report, which the site keeps.
+agrees the bin edges. The third is setup round 3: the site bins its data with the agreed bin edges and
+counts its rows per bin of each numerical feature, from which the aggregator fixes the most frequent bins.
+Every later round is a split round, the closing round or a padding round. The round after a tree is
+complete carries that tree's per-leaf row counts and the site's training loss after it. The reply that
+ends training delivers the finished model and the training report, which the site keeps.
 """
 
 from collections.abc import Sequence
@@ -58,6 +59,8 @@ class Site:
             self.label_weights = tuple(reply.get("label_weights", (1.0, 1.0)))
             return self._grid_payload(reply["bounds"], reply["categories"])
         if self._round == 3:
+            return self._bin_payload(reply)
+        if self._round == 4:
             self._agree(reply)
         return self._split_round(reply)
 
@@ -94,17 +97,23 @@ class Site:
             "na_counts": na_counts,
         }
 
-    def _agree(self, reply: dict) -> None:
-        mappers = [BinMapper(np.asarray(bounds), missing_type, most_freq_bin,
+    def _bin_payload(self, reply: dict) -> dict:
+        """Bin the data with the agreed bin edges; the rows per bin of each numerical feature, all in one flat
+        array."""
+        # The most frequent bin, which binning does not use, comes with the next reply.
+        mappers = [BinMapper(np.asarray(bounds), missing_type, 0,
                              None if categories is None else np.array(categories, dtype=np.int64))
-                   for bounds, missing_type, most_freq_bin, categories in zip(
-                       reply["bin_upper_bounds"], reply["missing_types"], reply["most_freq_bins"],
-                       reply["bin_categories"])]
+                   for bounds, missing_type, categories in zip(
+                       reply["bin_upper_bounds"], reply["missing_types"], reply["bin_categories"])]
         self.num_bins = np.array([m.num_bins for m in mappers])
-        self.most_freq_bins = most_freq_bin_positions(self.num_bins, np.array(reply["most_freq_bins"]))
         self.binned = bin_values(self.X, mappers)
         self.missing_bins = np.array([-1 if m.is_categorical else missing_bin(m.upper_bounds, m.missing_type)
                                       for m in mappers])
+        counts = [m.counts(x) for m, x in zip(mappers, self.X.T) if not m.is_categorical]
+        return {"bin_counts": self.encoding.encode_counts(np.concatenate([np.zeros(0, dtype=np.int64), *counts]))}
+
+    def _agree(self, reply: dict) -> None:
+        self.most_freq_bins = most_freq_bin_positions(self.num_bins, np.array(reply["most_freq_bins"]))
         self.leaf = np.zeros(len(self.labels), dtype=np.int32)
         self._compute_gradients()
 

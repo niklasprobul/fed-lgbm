@@ -9,6 +9,7 @@ from fl_lightgbm.binning import (
     bin_values,
     category_codes,
     grid,
+    with_most_freq_bin,
 )
 from fl_lightgbm.histogram import Histogram, leaf_histogram
 from fl_lightgbm.params import Params
@@ -29,7 +30,7 @@ def lightgbm_threshold(value):
 
 
 def agreed_bin_mappers(X, params, categorical=()):
-    """The agreed bins of one site holding all rows: both setup rounds without the transport."""
+    """The agreed bins of one site holding all rows: the setup rounds without the transport."""
     bin_mappers = []
     for f, x in enumerate(X.T):
         if f in categorical:
@@ -39,7 +40,8 @@ def agreed_bin_mappers(X, params, categorical=()):
                                                             int(np.sum(codes < 0)), len(x), params))
             continue
         g = grid(np.fmin.reduce(x), np.fmax.reduce(x))
-        bin_mappers.append(agree_bin_mapper(g, g.counts(x), int(np.isnan(x).sum()), len(x), params))
+        mapper = agree_bin_mapper(g, g.counts(x), int(np.isnan(x).sum()), len(x), params)
+        bin_mappers.append(with_most_freq_bin(mapper, mapper.counts(x), len(x)))
     binned = bin_values(X, bin_mappers)
     return bin_mappers, binned
 

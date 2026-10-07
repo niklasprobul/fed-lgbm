@@ -86,7 +86,7 @@ def test_client_app_calls_aggregate_once_per_budgeted_round_with_unique_communic
         output = app.run_train(Input(data=write_site_csv(tmp_path / "data.csv", X, y)))
 
     ids = communicator.communication_ids
-    assert len(ids) == config.federated_rounds == 2 + 4 * 5 + 1 + 1
+    assert len(ids) == config.federated_rounds == 3 + 4 * 5 + 1 + 1
     assert len(set(ids)) == len(ids)
     assert all(len(i.encode()) <= 255 for i in ids)
     assert len(json.dumps(communicator.replies[-1])) < 100  # FL-Net ships the last reply in its finish message

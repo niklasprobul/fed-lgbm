@@ -13,12 +13,14 @@ from fl_lightgbm.binning import (
     MISSING_NAN,
     MISSING_NONE,
     MISSING_ZERO,
+    ZERO_THRESHOLD,
     BinMapper,
     Categories,
     agree_bin_mapper,
     agree_categorical_bin_mapper,
     category_codes,
     grid,
+    with_most_freq_bin,
 )
 from fl_lightgbm.params import Params
 
@@ -78,7 +80,8 @@ def mixed_features(seed, n=1200):
 
 
 def agree(X, sites, params):
-    """Both setup rounds for the bin edges, without the transport: global bounds, then summed grid counts."""
+    """The setup rounds for the bin edges, without the transport: global bounds, then summed grid counts, then
+    summed counts per agreed bin."""
     mappers = []
     for f in range(X.shape[1]):
         lo = np.fmin.reduce([np.fmin.reduce(X[rows, f]) for rows in sites])
@@ -86,21 +89,9 @@ def agree(X, sites, params):
         g = grid(lo, hi)
         counts = sum(g.counts(X[rows, f]) for rows in sites)
         na_count = sum(int(np.isnan(X[rows, f]).sum()) for rows in sites)
-        mappers.append(agree_bin_mapper(g, counts, na_count, len(X), params))
+        mapper = agree_bin_mapper(g, counts, na_count, len(X), params)
+        mappers.append(with_most_freq_bin(mapper, sum(mapper.counts(X[rows, f]) for rows in sites), len(X)))
     return mappers
-
-
-def grid_data(X, sites):
-    """The pooled rows as the grid sees them: each row replaced by its grid cell's value, zeros and NaN kept."""
-    columns = []
-    for f in range(X.shape[1]):
-        x = X[:, f]
-        g = grid(np.fmin.reduce(x), np.fmax.reduce(x))
-        counts = sum(g.counts(x[rows]) for rows in sites)
-        na_count = int(np.isnan(x).sum())
-        zeros = len(x) - counts.sum() - na_count
-        columns.append(np.concatenate([np.repeat(g.values, counts), np.zeros(zeros), np.full(na_count, np.nan)]))
-    return np.column_stack(columns)
 
 
 SETTINGS = [
@@ -111,18 +102,6 @@ SETTINGS = [
     {"zero_as_missing": True},
     {"use_missing": False},
 ]
-
-
-@pytest.mark.parametrize("settings", SETTINGS)
-def test_agreed_edges_equal_lightgbm_binning_of_the_grid_cells(settings):
-    X = mixed_features(seed=1)
-    sites = np.array_split(np.random.default_rng(2).permutation(len(X)), 3)
-
-    mappers = agree(X, sites, Params.from_dict(settings))
-
-    lgb_params = {**settings, "bin_construct_sample_cnt": len(X), "feature_pre_filter": False,
-                  "enable_bundle": False, "verbose": -1}
-    assert_same_as_lightgbm(lgb.Dataset(grid_data(X, sites), np.zeros(len(X)), params=lgb_params), mappers)
 
 
 @pytest.mark.parametrize("settings", SETTINGS)
@@ -179,38 +158,77 @@ def test_categorical_bin_mapping_equals_lightgbm_on_the_pooled_rows(settings):
 
 
 @pytest.mark.parametrize("lo, hi", [
-    (5.0, 5.0 + 1e-12),
-    (1e8, 1e8 + 1e-6),
-    (-1e8 - 1e-6, -1e8),
+    (5.0, 5.0 + 1e-14),
+    (1e8, 1e8 + 1e-7),
+    (-1e8 - 1e-7, -1e8),
     (1e8, np.nextafter(1e8, 2e8)),  # too close for two cells
-    (1e-320, 2e-320),  # subnormal: the width of GRID_CELLS cells underflows to 0
+    (1e-322, 2e-322),  # subnormal: the width of GRID_CELLS cells underflows to 0
 ])
 def test_grid_between_bounds_below_the_resolution_of_doubles_has_fewer_distinct_cells(lo, hi):
-    values = grid(lo, hi).values
+    bounds = grid(lo, hi).bounds
 
-    assert 1 <= len(values) < GRID_CELLS
-    assert np.all(values[1:] > np.nextafter(values[:-1], np.inf))  # not equal in Common::CheckDoubleEqualOrdered
+    assert 1 <= len(bounds) - 1 < GRID_CELLS
+    assert np.all(np.diff(bounds) > 0)
+    assert (bounds[0], bounds[-1]) == (lo, hi)
 
 
 @pytest.mark.parametrize("lo, hi", [(0.0, 1.0), (-3.0, 7.0), (-1e-300, 1e300), (1e8, 1e8 + 1.0), (2.5, 4.0)])
-def test_grid_between_ordinary_bounds_has_the_full_number_of_cells_of_equal_width(lo, hi):
-    values = grid(lo, hi).values
+def test_grid_between_ordinary_bounds_has_64_cells_of_equal_width(lo, hi):
+    bounds = grid(lo, hi).bounds
 
-    assert len(values) in (GRID_CELLS, GRID_CELLS + 1)  # laid out from 0, so the bounds may cut a cell at each end
-    np.testing.assert_allclose(np.diff(values), (hi - lo) / GRID_CELLS, rtol=1e-6)
+    assert GRID_CELLS == 64
+    assert len(bounds) - 1 in (64, 65)  # laid out from 0, so the bounds may cut a cell at each end
+    assert (bounds[0], bounds[-1]) == (lo, hi)
+    np.testing.assert_allclose(np.diff(bounds)[1:-1], (hi - lo) / 64, rtol=1e-6)
+    assert np.all(np.diff(bounds) <= (hi - lo) / 64 * (1 + 1e-6))
 
 
-def test_most_frequent_bin_equals_lightgbm_on_rows_just_above_neighbouring_narrow_grid_cells():
-    """Cells two ulps apart (4,096 between 1e6 and 1e6 + 1e-6) are distinct doubles, but the bound between
-    them is the upper cell's value, so that cell's rows would be counted in the bin below it."""
-    lo, hi = 1e6, 1e6 + 1e-6
-    values = grid(lo, hi).values
-    k = len(values) // 2
-    x = np.where(np.arange(1000) < 200, np.nextafter(values[k], np.inf), np.nextafter(values[k + 1], np.inf))
-    x[:2] = lo, hi
-    X = x[:, None]
+def test_grid_between_bounds_whose_range_overflows_a_double_has_64_cells_split_at_0():
+    bounds = grid(-1e308, 1e308).bounds
 
-    mappers = agree(X, np.array_split(np.arange(len(X)), 3), Params.from_dict({}))
+    assert len(bounds) - 1 == 64
+    assert 0.0 in bounds and np.all(np.isfinite(bounds)) and np.all(np.diff(bounds) > 0)
 
-    with central_dataset(X, np.zeros(len(X)), mappers, {}) as dataset:
+
+def test_grid_cells_hold_values_of_one_sign_only():
+    g = grid(-3.0, 7.0)
+
+    assert 0.0 in g.bounds
+    counts = g.counts(np.array([-1e-3, 1e-3, 0.0, np.nan]))  # zeros and NaN are not in the grid
+    assert counts.sum() == 2
+    assert np.flatnonzero(counts).tolist() == [np.searchsorted(g.bounds, 0.0) - 1, np.searchsorted(g.bounds, 0.0)]
+
+
+def test_agreed_edges_split_the_nonzero_rows_into_bins_of_about_equal_count():
+    x = np.random.default_rng(6).uniform(1.0, 2.0, size=25_400)
+
+    (mapper,) = agree(x[:, None], np.array_split(np.arange(len(x)), 3), Params.from_dict({}))
+
+    # 255 bins: the bin of 0, then 254 of positive values, about 100 rows each
+    assert mapper.num_bins == 255
+    rows = mapper.counts(x)
+    assert rows[0] == 0
+    assert np.all(np.abs(rows[1:] - 100) <= 30)
+
+
+@pytest.mark.parametrize("min_data_in_bin", [1, 3, 10])
+def test_agreed_edges_have_at_most_one_bin_per_min_data_in_bin_rows(min_data_in_bin):
+    x = np.concatenate([np.random.default_rng(7).normal(size=60), np.zeros(40)])
+
+    (mapper,) = agree(x[:, None], [np.arange(len(x))], Params.from_dict({"min_data_in_bin": min_data_in_bin}))
+
+    # the bin of 0, and at most 60 // min_data_in_bin bins of the nonzero rows, one more where 0 splits one
+    assert mapper.num_bins <= 2 + 60 // min_data_in_bin
+    assert {-ZERO_THRESHOLD, ZERO_THRESHOLD} <= set(mapper.upper_bounds)
+    assert mapper.counts(x)[mapper.default_bin] == 40
+
+
+def test_agreed_edges_with_max_bin_two_keep_one_zero_bound_as_lightgbm():
+    """Too few bins for both zero bounds: LightGBM's FindBinWithPredefinedBin keeps -kZeroThreshold."""
+    X = np.random.default_rng(8).normal(size=(500, 1))
+
+    mappers = agree(X, [np.arange(len(X))], Params.from_dict({"max_bin": 2}))
+
+    assert mappers[0].upper_bounds.tolist() == [-ZERO_THRESHOLD, np.inf]
+    with central_dataset(X, np.zeros(len(X)), mappers, {"max_bin": 2}) as dataset:
         assert_same_as_lightgbm(dataset, mappers)
